@@ -1,0 +1,179 @@
+name: Build llama.cpp ROCm Windows (gfx1200)
+
+on:
+  workflow_dispatch:          # Manual trigger from the Actions tab
+  push:
+    tags:
+      - 'b*'                  # Trigger on llama.cpp release tags (b1234, etc.)
+  schedule:
+    - cron: '0 3 * * *'       # Daily at 03:00 UTC
+
+jobs:
+  build-rocm-windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine llama.cpp tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
+          fi
+          echo "name=$TAG" >> $GITHUB_OUTPUT
+          echo "Building tag: $TAG"
+
+      - name: Checkout llama.cpp at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ steps.tag.outputs.name }}
+          path: llama.cpp
+
+      - name: Cache ROCm
+        id: cache-rocm
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\AMD\ROCm
+          key: rocm-windows-7.1.1-v1
+          restore-keys: |
+            rocm-windows-
+
+      - name: Install ROCm 7.1.1 HIP SDK
+        if: steps.cache-rocm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q1-Win11-For-HIP.exe"
+          $installer = "$env:RUNNER_TEMP\rocm-install.exe"
+          Write-Host "Downloading ROCm 7.1.1 HIP SDK..."
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Write-Host "Installing ROCm 7.1.1 HIP SDK..."
+          $proc = Start-Process $installer -ArgumentList '-install' -NoNewWindow -PassThru
+          $completed = $proc.WaitForExit(900000)
+          if (-not $completed) { $proc.Kill(); Write-Error "ROCm install timed out"; exit 1 }
+          if ($proc.ExitCode -ne 0) { Write-Error "ROCm install failed: $($proc.ExitCode)"; exit 1 }
+          Write-Host "ROCm 7.1.1 installed."
+
+      - name: Verify ROCm
+        shell: pwsh
+        run: |
+          $clang = Get-ChildItem 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Select-Object -First 1
+          if (-not $clang) { Write-Error "clang not found"; exit 1 }
+          & $clang.FullName --version
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure CMake
+        working-directory: ./llama.cpp
+        shell: pwsh
+        run: |
+          $hipPath = (Get-ChildItem 'C:\Program Files\AMD\ROCm' -Directory | Select-Object -First 1).FullName
+          $env:HIP_PATH = $hipPath
+          $env:PATH = "$hipPath\bin;$env:PATH"
+
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_HIP=ON `
+            -DAMDGPU_TARGETS=gfx1200 `
+            -DCMAKE_C_COMPILER=clang `
+            -DCMAKE_CXX_COMPILER=clang++ `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON
+
+      - name: Build
+        working-directory: ./llama.cpp
+        shell: pwsh
+        run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Package Release
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.tag.outputs.name }}"
+          $pkg = "llama-$tag-bin-win-rocm-gfx1200-x64"
+          $stage = "$env:RUNNER_TEMP\$pkg"
+          New-Item -ItemType Directory -Path $stage -Force
+
+          Copy-Item -Path ".\llama.cpp\build\bin\*" -Destination $stage -Recurse -Force
+
+          $rocmRoot = (Get-ChildItem 'C:\Program Files\AMD\ROCm' -Directory | Select-Object -First 1).FullName
+          $rocmBin  = Join-Path $rocmRoot 'bin'
+
+          # Core runtime DLLs required by ggml-hip.dll
+          $requiredDlls = @(
+            'amdhip64_7.dll',
+            'rocm_kpack.dll',
+            'amd_comgr.dll',
+            'rocblas.dll',
+            'hipblas.dll',
+            'libhipblaslt.dll',
+            'rocsolver.dll'
+          )
+          foreach ($dll in $requiredDlls) {
+            $src = Join-Path $rocmBin $dll
+            if (Test-Path $src) {
+              Copy-Item $src -Destination $stage -Force
+              Write-Host "Copied $dll"
+            } else {
+              Write-Warning "MISSING: $dll not found in $rocmBin"
+            }
+          }
+
+          # rocBLAS Tensile kernels for gfx1200
+          $tensileSrc = Get-ChildItem -Path $rocmRoot -Recurse -Directory -Filter "library" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Parent.Name -eq "rocblas" } |
+            Select-Object -First 1
+
+          if (-not $tensileSrc) {
+            Write-Error "rocblas\library directory not found under $rocmRoot"
+            exit 1
+          }
+
+          $tensileDst = Join-Path $stage 'rocblas\library'
+          New-Item -ItemType Directory -Force -Path $tensileDst | Out-Null
+
+          $targets = @('gfx1200', 'gfx1201')
+          $copied = 0
+          foreach ($f in Get-ChildItem -Path $tensileSrc.FullName -File) {
+            $match = [regex]::Match($f.Name, 'gfx[0-9a-f]+')
+            if ($match.Success -and ($targets -notcontains $match.Value)) { continue }
+            Copy-Item $f.FullName -Destination $tensileDst -Force
+            $copied++
+          }
+          Write-Host "rocblas\library: copied $copied files"
+
+          Compress-Archive -Path "$stage\*" -DestinationPath "$env:RUNNER_TEMP\$pkg.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-rocm-windows-gfx1200
+          path: ${{ runner.temp }}/llama-*-bin-win-rocm-gfx1200-x64.zip
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "llama.cpp ${{ steps.tag.outputs.name }} (ROCm 7.1.1 Windows gfx1200)"
+          body: |
+            Automated ROCm 7.1.1 build for AMD RX 9060 XT (gfx1200).
+
+            **Included:** llama.cpp binaries + bundled ROCm 7.1.1 runtime DLLs + rocBLAS Tensile kernels for gfx1200/gfx1201.
+
+            **Requires:**
+            - AMD Adrenalin driver 26.6.4 or newer
+            - Visual C++ 2015-2022 Redistributable
+
+            ```powershell
+            llama-server.exe -m model.gguf -ngl 99
